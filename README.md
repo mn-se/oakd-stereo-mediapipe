@@ -113,4 +113,4 @@ MediaPipe自身が手の検出後にランドマーク推定用の手領域を�
 
 - `check_oak.py`: 接続されているOAK-Dの確認
 - `check_calib.py`: 工場キャリブレーションの確認
-- `oakd_stereo.py`: MediaPipeを使わない左右カメラ映像の確認
+- `check_stereo.py`: MediaPipeを使わない左右カメラ映像の確認
