@@ -44,6 +44,47 @@ uv run python oakd_stereo_mediapipe.py --model .\hand_landmarker.task
 
 `q` キーで終了します。
 
+## ONNXモデルの生成
+
+`.task` に含まれるPalm DetectionとHand LandmarkのTFLiteモデルを、ローカルでONNXへ変換できます。
+
+変換を行うときだけ、追加依存関係をインストールします。
+
+```powershell
+uv sync --extra conversion
+```
+
+```powershell
+uv run python convert_task_to_onnx.py --task .\hand_landmarker.task
+```
+
+生成されるファイルは次の2つです。
+
+- `models/hand_detector.onnx`
+- `models/hand_landmarks_detector.onnx`
+
+生成されたONNXモデルは`.gitignore`で除外しています。`.task`から派生したモデルを再配布しないため、各自の環境で生成してください。ONNX Runtimeで利用する場合は、Palm Detectionのアンカー復号、NMS、手ROI生成、ランドマーク座標の逆変換も実装する必要があります。
+
+生成後は、ONNX Runtime版を次のように実行できます。
+
+```powershell
+uv run python oakd_stereo_onnx.py `
+	--detector .\models\hand_detector.onnx `
+	--landmarks .\models\hand_landmarks_detector.onnx
+```
+
+ONNX版では、MediaPipe Tasksを使わず、ONNX RuntimeでPalm DetectionとHand Landmarkを実行します。左右フレームの同期、ステレオ補正、三角測量はMediaPipe版と同じ考え方です。
+
+## MediaPipeとONNXの同一入力比較
+
+同じOAK-Dの左右フレームをMediaPipe版とONNX版へ入力し、21点の座標差を比較できます。追跡の影響を除くため、両方とも初回検出モードで比較します。
+
+```powershell
+uv run python compare_backends.py
+```
+
+左右それぞれについて、平均誤差、最大誤差、ランドマークごとの座標と誤差が表示されます。
+
 ## 処理構成
 
 - 左右カメラのフレームをシーケンス番号で同期

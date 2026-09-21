@@ -1,22 +1,40 @@
 import argparse
-import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
+import os
+import time
 from queue import Empty, Full
 from pathlib import Path
+from queue import Queue
+from threading import Event, Thread
 from typing import NamedTuple
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import cv2
 import depthai as dai
 import mediapipe as mp
 import numpy as np
+from absl import logging as absl_logging
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from stereo_common import (
+    DISPLAY_IMAGE_WIDTH,
+    HAND_CONNECTIONS,
+    INFERENCE_HEIGHT,
+    INFERENCE_WIDTH,
+    MEASUREMENT_HEIGHT,
+    MEASUREMENT_WIDTH,
+    PointSmoother,
+    StereoFrameSynchronizer as CommonStereoFrameSynchronizer,
+    create_camera_pipeline as common_create_camera_pipeline,
+    triangulate_landmarks as common_triangulate_landmarks,
+    suppress_native_stderr,
+)
 
-
-MEASUREMENT_WIDTH = 1280
-MEASUREMENT_HEIGHT = 800
-INFERENCE_WIDTH = 640
-INFERENCE_HEIGHT = 400
-DISPLAY_IMAGE_WIDTH = 640
+absl_logging.set_verbosity(absl_logging.ERROR)
+absl_logging.set_stderrthreshold(absl_logging.ERROR)
 
 
 # MediaPipe Hand landmark IDs
@@ -96,27 +114,6 @@ class StereoFrameSynchronizer:
             for frame_sequence in list(frames):
                 if frame_sequence <= sequence:
                     del frames[frame_sequence]
-
-
-class PointSmoother:
-    def __init__(self, alpha=0.25):
-        self._alpha = alpha
-        self._value = None
-
-    def update(self, value):
-        if value is None:
-            self._value = None
-            return None
-
-        value = np.asarray(value, dtype=np.float64)
-        if self._value is None:
-            self._value = value
-        else:
-            self._value = (
-                self._alpha * value
-                + (1.0 - self._alpha) * self._value
-            )
-        return self._value.copy()
 
 
 def create_rectification_maps(calib):
@@ -255,30 +252,6 @@ def draw_landmarks(image, landmarks):
 
     height, width = image.shape[:2]
 
-    connections = [
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 4),
-        (0, 5),
-        (5, 6),
-        (6, 7),
-        (7, 8),
-        (5, 9),
-        (9, 10),
-        (10, 11),
-        (11, 12),
-        (9, 13),
-        (13, 14),
-        (14, 15),
-        (15, 16),
-        (13, 17),
-        (17, 18),
-        (18, 19),
-        (19, 20),
-        (0, 17),
-    ]
-
     pixel_points = []
 
     for landmark in landmarks:
@@ -294,7 +267,7 @@ def draw_landmarks(image, landmarks):
             -1,
         )
 
-    for index_a, index_b in connections:
+    for index_a, index_b in HAND_CONNECTIONS:
         cv2.line(
             image,
             pixel_points[index_a],
@@ -340,19 +313,27 @@ def create_hand_landmarker(model_path):
     return vision.HandLandmarker.create_from_options(options)
 
 
+def create_quiet_hand_landmarker(model_path):
+    with suppress_native_stderr():
+        return create_hand_landmarker(model_path)
+
+
 class HandInferenceWorker:
     def __init__(self, model_path):
-        context = multiprocessing.get_context("spawn")
-        self._frames = context.Queue(maxsize=1)
-        self._results = context.Queue(maxsize=1)
+        self._frames = Queue(maxsize=1)
+        self._results = Queue(maxsize=1)
+        self._ready = Event()
         self._model_path = model_path
-        self._process = context.Process(
+        self._thread = Thread(
             target=HandInferenceWorker._run,
-            args=(self._frames, self._results, self._model_path),
+            args=(self._frames, self._results, self._ready, self._model_path),
             name="hand-inference",
             daemon=True,
         )
-        self._process.start()
+        self._thread.start()
+
+    def is_ready(self):
+        return self._ready.is_set()
 
     def submit(self, rgb_left, rgb_right):
         try:
@@ -374,71 +355,101 @@ class HandInferenceWorker:
                 return latest_result
 
     @staticmethod
-    def _run(frames, results, model_path):
-        hands_left = create_hand_landmarker(model_path)
-        hands_right = create_hand_landmarker(model_path)
+    def _run(frames, results, ready, model_path):
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            hands_left, hands_right = executor.map(
+                create_quiet_hand_landmarker,
+                (model_path, model_path),
+            )
         timestamp_ms = 0
+        print(
+            "MediaPipe inference worker ready "
+            f"({time.perf_counter() - started:.1f}s)",
+            flush=True,
+        )
+        ready.set()
 
         try:
-            while True:
-                images = frames.get()
-                if images is None:
-                    break
-
-                rgb_left, rgb_right = images
-                timestamp_ms += 33
-                image_left = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=rgb_left,
-                )
-                image_right = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=rgb_right,
-                )
-                result_left = hands_left.detect_for_video(
-                    image_left,
-                    timestamp_ms,
-                )
-                result_right = hands_right.detect_for_video(
-                    image_right,
-                    timestamp_ms,
-                )
-
-                landmarks_left = (
-                    [
-                        LandmarkPoint(
-                            landmark.x,
-                            landmark.y,
-                            landmark.z,
-                        )
-                        for landmark in result_left.hand_landmarks[0]
-                    ]
-                    if result_left.hand_landmarks
-                    else None
-                )
-                landmarks_right = (
-                    [
-                        LandmarkPoint(
-                            landmark.x,
-                            landmark.y,
-                            landmark.z,
-                        )
-                        for landmark in result_right.hand_landmarks[0]
-                    ]
-                    if result_right.hand_landmarks
-                    else None
-                )
-
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first_result = True
                 while True:
-                    try:
-                        results.get_nowait()
-                    except Empty:
+                    images = frames.get()
+                    if images is None:
                         break
 
-                try:
-                    results.put_nowait((landmarks_left, landmarks_right))
-                except Full:
-                    pass
+                    rgb_left, rgb_right = images
+                    timestamp_ms += 33
+                    image_left = mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=rgb_left,
+                    )
+                    image_right = mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=rgb_right,
+                    )
+                    started = time.perf_counter()
+                    result_left, result_right = executor.map(
+                        lambda args: args[0].detect_for_video(
+                            args[1],
+                            args[2],
+                        ),
+                        (
+                            (hands_left, image_left, timestamp_ms),
+                            (hands_right, image_right, timestamp_ms),
+                        ),
+                    )
+                    elapsed_ms = (time.perf_counter() - started) * 1000.0
+                    if first_result:
+                        print(
+                            "MediaPipe first inference: "
+                            f"{elapsed_ms:.0f} ms, "
+                            f"left={bool(result_left.hand_landmarks)}, "
+                            f"right={bool(result_right.hand_landmarks)}",
+                            flush=True,
+                        )
+                        first_result = False
+                    elif elapsed_ms > 250.0:
+                        print(
+                            f"MediaPipe inference: {elapsed_ms:.0f} ms",
+                            flush=True,
+                        )
+
+                    landmarks_left = (
+                        [
+                            LandmarkPoint(
+                                landmark.x,
+                                landmark.y,
+                                landmark.z,
+                            )
+                            for landmark in result_left.hand_landmarks[0]
+                        ]
+                        if result_left.hand_landmarks
+                        else None
+                    )
+                    landmarks_right = (
+                        [
+                            LandmarkPoint(
+                                landmark.x,
+                                landmark.y,
+                                landmark.z,
+                            )
+                            for landmark in result_right.hand_landmarks[0]
+                        ]
+                        if result_right.hand_landmarks
+                        else None
+                    )
+
+                    while True:
+                        try:
+                            results.get_nowait()
+                        except Empty:
+                            break
+
+                    try:
+                        results.put_nowait((landmarks_left, landmarks_right))
+                    except Full:
+                        pass
         finally:
             hands_left.close()
             hands_right.close()
@@ -454,12 +465,7 @@ class HandInferenceWorker:
         except Full:
             pass
 
-        self._process.join(timeout=2.0)
-        if self._process.is_alive():
-            self._process.terminate()
-            self._process.join()
-        self._frames.close()
-        self._results.close()
+        self._thread.join(timeout=2.0)
 
 
 def create_camera_pipeline(device):
@@ -530,8 +536,6 @@ def prepare_stereo_frames(frame_left, frame_right, rectification):
         map_right_y,
         _,
         _,
-        _,
-        _,
     ) = rectification
 
     rect_left = cv2.remap(
@@ -566,13 +570,33 @@ def calculate_points_3d(landmarks_left, landmarks_right, p_left, p_right):
     if landmarks_left is None or landmarks_right is None:
         return None
 
-    points_3d_mm = triangulate_landmarks(
-        landmarks_left,
-        landmarks_right,
+    pixel_landmarks_left = np.asarray(
+        [
+            (
+                landmark.x * MEASUREMENT_WIDTH,
+                landmark.y * MEASUREMENT_HEIGHT,
+                landmark.z,
+            )
+            for landmark in landmarks_left
+        ],
+        dtype=np.float64,
+    )
+    pixel_landmarks_right = np.asarray(
+        [
+            (
+                landmark.x * MEASUREMENT_WIDTH,
+                landmark.y * MEASUREMENT_HEIGHT,
+                landmark.z,
+            )
+            for landmark in landmarks_right
+        ],
+        dtype=np.float64,
+    )
+    points_3d_mm = common_triangulate_landmarks(
+        pixel_landmarks_left,
+        pixel_landmarks_right,
         p_left,
         p_right,
-        MEASUREMENT_WIDTH,
-        MEASUREMENT_HEIGHT,
     )
 
 
@@ -680,19 +704,24 @@ def main():
         )
 
     device = dai.Device()
-    pipeline, left_queue, right_queue, rectification = create_camera_pipeline(
+    pipeline, left_queue, right_queue, rectification = common_create_camera_pipeline(
         device
     )
-    _, _, _, _, p_left, p_right, _, _ = rectification
+    _, _, _, _, p_left, p_right = rectification
 
     inference_worker = HandInferenceWorker(model_path)
-    frame_synchronizer = StereoFrameSynchronizer(
+    frame_synchronizer = CommonStereoFrameSynchronizer(
         left_queue,
         right_queue,
     )
     point_smoother = PointSmoother()
     latest_landmarks_left = None
     latest_landmarks_right = None
+    inference_ready = False
+    process_started_at = time.perf_counter()
+    first_display_at = None
+    ready_logged = False
+    first_result_logged = False
 
     try:
         while pipeline.isRunning():
@@ -717,8 +746,24 @@ def main():
             inference_worker.submit(rgb_left, rgb_right)
             inference_result = inference_worker.poll()
 
+            inference_ready = inference_worker.is_ready()
+            if inference_ready and not ready_logged:
+                ready_logged = True
+                ready_elapsed = time.perf_counter() - process_started_at
+                print(
+                    f"MediaPipe ready observed after {ready_elapsed:.3f}s",
+                    flush=True,
+                )
             if inference_result is not None:
                 latest_landmarks_left, latest_landmarks_right = inference_result
+                if not first_result_logged:
+                    first_result_logged = True
+                    result_elapsed = time.perf_counter() - process_started_at
+                    print(
+                        f"MediaPipe first result observed after "
+                        f"{result_elapsed:.3f}s",
+                        flush=True,
+                    )
 
             raw_points_3d_mm = calculate_points_3d(
                 latest_landmarks_left,
@@ -737,6 +782,26 @@ def main():
                 latest_landmarks_right,
                 points_3d_mm,
             )
+
+            if not inference_ready:
+                cv2.putText(
+                    combined,
+                    "Initializing MediaPipe...",
+                    (18, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+            if first_display_at is None:
+                first_display_at = time.perf_counter()
+                display_elapsed = first_display_at - process_started_at
+                print(
+                    f"MediaPipe first display after {display_elapsed:.3f}s",
+                    flush=True,
+                )
 
             cv2.imshow("OAK-D Stereo Hand 3D", combined)
 

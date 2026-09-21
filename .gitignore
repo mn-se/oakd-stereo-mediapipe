@@ -11,3 +11,10 @@ wheels/
 
 # MediaPipe model (download separately; do not redistribute)
 hand_landmarker.task
+
+# Generated ONNX models (derive locally from hand_landmarker.task)
+models/*.onnx
+
+# compare_backends.py debug/output artifacts
+compare_out*.txt
+comparison_debug/
