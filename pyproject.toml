@@ -1,0 +1,11 @@
+[project]
+name = "oakd"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "depthai>=3.10.0",
+    "mediapipe>=1.0.1",
+    "opencv-python>=5.0.0.93",
+]
